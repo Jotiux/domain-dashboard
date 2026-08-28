@@ -347,20 +347,34 @@ export async function getDmarc(domain) {
 
 // --- Listas negras (blacklists) ---
 // Se consultan directamente por DNS contra listas públicas gratuitas.
-// Si el subdominio "dominio.lista.org" resuelve a una IP, está listado.
+// Si el subdominio "consulta.lista.org" resuelve a una IP, está listado.
 // Si da NXDOMAIN/ENODATA, no está listado.
-const BLACKLIST_ZONES = [
-  { name: "Spamhaus DBL", zone: "dbl.spamhaus.org" },
-  { name: "SURBL", zone: "multi.surbl.org" },
-];
+//
+// OJO con un detalle importante de Spamhaus (DBL y ZEN): cuando detecta
+// que las consultas vienen de infraestructura compartida en la nube (como
+// Vercel, AWS, etc.), en vez de un error normal responde con una IP especial
+// que significa "tu consulta fue bloqueada/limitada" — NO que el dominio o
+// la IP estén en la lista. Si tratáramos esa respuesta como "listado"
+// tendríamos falsos positivos (esto es justo lo que pasaba antes). Por eso
+// filtramos ese rango de IPs "de error" y lo reportamos como "no se pudo
+// verificar" en vez de "listado".
+const DNSBL_ERROR_CODES = new Set([
+  "127.255.255.252", // nombre de consulta mal formado
+  "127.255.255.254", // bloqueado: consulta vía resolutor público/compartido
+  "127.255.255.255", // bloqueado: demasiadas consultas (rate limit)
+]);
 
-async function checkZone(domain, zone) {
+async function checkZone(query) {
   try {
-    await withTimeout(
-      dnsPromises.resolve4(`${domain}.${zone}`),
-      7000,
-      "timeout"
-    );
+    const ips = await withTimeout(dnsPromises.resolve4(query), 7000, "timeout");
+    const realListing = ips.filter((ip) => !DNSBL_ERROR_CODES.has(ip));
+
+    if (realListing.length === 0) {
+      return {
+        listed: null,
+        error: "El proveedor de la lista limitó la consulta (no es una lista real)",
+      };
+    }
     return { listed: true };
   } catch (err) {
     if (err.code === "ENOTFOUND" || err.code === "ENODATA") {
@@ -370,10 +384,16 @@ async function checkZone(domain, zone) {
   }
 }
 
+// Listas que revisan el DOMINIO en sí.
+const DOMAIN_BLACKLIST_ZONES = [
+  { name: "Spamhaus DBL", zone: "dbl.spamhaus.org" },
+  { name: "SURBL", zone: "multi.surbl.org" },
+];
+
 export async function getBlacklists(domain) {
   const results = await Promise.all(
-    BLACKLIST_ZONES.map(async (bl) => {
-      const r = await checkZone(domain, bl.zone);
+    DOMAIN_BLACKLIST_ZONES.map(async (bl) => {
+      const r = await checkZone(`${domain}.${bl.zone}`);
       return { name: bl.name, ...r };
     })
   );
@@ -390,31 +410,24 @@ export async function getBlacklists(domain) {
   };
 }
 
-// --- Spamhaus ZEN sobre la IP del servidor de correo (MX) ---
-// A diferencia de Spamhaus DBL/SURBL (que revisan el DOMINIO), ZEN revisa la
-// IP real del servidor que entrega el correo — es la comprobación que usan
-// las herramientas profesionales de entregabilidad, porque un dominio puede
-// verse "limpio" y aun así su servidor de correo estar en una IP marcada
-// como fuente de spam.
-async function checkZenForIp(ip) {
-  try {
-    const reversed = ip.split(".").reverse().join(".");
-    await withTimeout(
-      dnsPromises.resolve4(`${reversed}.zen.spamhaus.org`),
-      7000,
-      "timeout"
-    );
-    return { listed: true };
-  } catch (err) {
-    if (err.code === "ENOTFOUND" || err.code === "ENODATA") {
-      return { listed: false };
-    }
-    return { listed: null, error: err.code || err.message };
-  }
+// --- Listas negras sobre la IP del servidor de correo (MX) ---
+// A diferencia de Spamhaus DBL/SURBL (que revisan el DOMINIO), estas revisan
+// la IP real del servidor que entrega el correo — el mismo enfoque que usa
+// MXToolbox, porque un dominio puede verse "limpio" y aun así su servidor de
+// correo estar en una IP marcada como fuente de spam.
+const IP_BLACKLIST_ZONES = [
+  { name: "Spamhaus ZEN", zone: "zen.spamhaus.org" },
+  { name: "Barracuda (BRBL)", zone: "b.barracudacentral.org" },
+  { name: "UCEPROTECT L1", zone: "dnsbl-1.uceprotect.net" },
+];
+
+async function checkIpZone(ip, zone) {
+  const reversed = ip.split(".").reverse().join(".");
+  return checkZone(`${reversed}.${zone}`);
 }
 
 // Recibe la lista de servidores MX (host + prioridad) que ya obtuvimos con
-// getMx(), resuelve su IP y consulta Spamhaus ZEN para cada una.
+// getMx(), resuelve su IP y la consulta contra cada lista de IP\_BLACKLIST\_ZONES.
 export async function getMxBlacklist(mxHosts) {
   if (!Array.isArray(mxHosts) || mxHosts.length === 0) {
     return { ok: true, results: [], isListed: false, hasUncertain: false };
@@ -422,38 +435,46 @@ export async function getMxBlacklist(mxHosts) {
 
   const results = [];
   for (const { host } of mxHosts) {
+    let ip = null;
     try {
-      const ips = await withTimeout(
-        dnsPromises.resolve4(host),
-        6000,
-        "timeout"
-      );
-      const ip = ips[0];
-      if (!ip) {
-        results.push({ host, ip: null, listed: null, error: "Sin IPv4" });
-        continue;
-      }
-      const r = await checkZenForIp(ip);
-      results.push({ host, ip, ...r });
-    } catch (err) {
+      const ips = await withTimeout(dnsPromises.resolve4(host), 6000, "timeout");
+      ip = ips[0] || null;
+    } catch {
+      // se maneja abajo (ip queda null)
+    }
+
+    if (!ip) {
       results.push({
         host,
         ip: null,
+        checks: [],
         listed: null,
         error: "No se pudo resolver la IP de este servidor",
       });
+      continue;
     }
+
+    const checks = await Promise.all(
+      IP_BLACKLIST_ZONES.map(async (bl) => {
+        const r = await checkIpZone(ip, bl.zone);
+        return { name: bl.name, ...r };
+      })
+    );
+
+    results.push({
+      host,
+      ip,
+      checks,
+      listed: checks.some((c) => c.listed === true),
+    });
   }
 
-  const listed = results.filter((r) => r.listed === true);
-  const uncertain = results.filter((r) => r.listed === null);
+  const listed = results.some((r) => r.listed === true);
+  const hasUncertain = results.some((r) =>
+    r.checks?.some((c) => c.listed === null)
+  );
 
-  return {
-    ok: true,
-    results,
-    isListed: listed.length > 0,
-    hasUncertain: uncertain.length > 0,
-  };
+  return { ok: true, results, isListed: listed, hasUncertain };
 }
 
 // Validación simple de dominio antes de consultar nada.
