@@ -26,9 +26,9 @@ function dmarcStatus(dmarc) {
   return "good";
 }
 
-function blacklistStatus(blacklists, mxBlacklist) {
-  if (blacklists.isListed || (mxBlacklist && mxBlacklist.isListed)) return "critical";
-  if (blacklists.hasUncertain || (mxBlacklist && mxBlacklist.hasUncertain)) return "neutral";
+function blacklistStatus(blacklists) {
+  if (blacklists.isListed) return "critical";
+  if (blacklists.hasUncertain) return "neutral";
   return "good";
 }
 
@@ -244,11 +244,8 @@ export default function Home() {
 
             <Card
               title="Listas negras (Blacklists)"
-              status={blacklistStatus(data.blacklists, data.mxBlacklist)}
+              status={blacklistStatus(data.blacklists)}
             >
-              <p className="muted" style={{ marginBottom: 2 }}>
-                <strong>Del dominio:</strong>
-              </p>
               <ul className="list">
                 {data.blacklists.results.map((r) => (
                   <li key={r.name}>
@@ -261,38 +258,6 @@ export default function Home() {
                   </li>
                 ))}
               </ul>
-
-              <p className="muted" style={{ marginTop: 10, marginBottom: 2 }}>
-                <strong>Del servidor de correo (por IP):</strong>
-              </p>
-              {data.mxBlacklist && data.mxBlacklist.results.length > 0 ? (
-                data.mxBlacklist.results.map((r) => (
-                  <div key={r.host} style={{ marginBottom: 6 }}>
-                    <p className="muted" style={{ marginBottom: 2 }}>
-                      {r.host}
-                      {r.ip ? ` (${r.ip})` : ""}
-                    </p>
-                    {r.checks && r.checks.length > 0 ? (
-                      <ul className="list">
-                        {r.checks.map((c) => (
-                          <li key={c.name}>
-                            {c.name}:{" "}
-                            {c.listed === true
-                              ? "❌ Listado"
-                              : c.listed === false
-                              ? "✅ Limpio"
-                              : "⚠️ No se pudo verificar"}
-                          </li>
-                        ))}
-                      </ul>
-                    ) : (
-                      <p className="muted">{r.error}</p>
-                    )}
-                  </div>
-                ))
-              ) : (
-                <p className="muted">No hay servidores MX que revisar</p>
-              )}
             </Card>
 
             <Card
