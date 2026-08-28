@@ -11,10 +11,10 @@ const STATUS = {
   neutral: { label: "Info", icon: "i", className: "status-neutral" },
 };
 
-function expirationStatus(expiration) {
-  if (!expiration.ok) return "neutral";
-  if (expiration.daysLeft < 0) return "critical";
-  if (expiration.daysLeft <= 30) return "warning";
+function expirationStatus(rdap) {
+  if (!rdap.ok || !rdap.expiration) return "neutral";
+  if (rdap.expiration.daysLeft < 0) return "critical";
+  if (rdap.expiration.daysLeft <= 30) return "warning";
   return "good";
 }
 
@@ -124,13 +124,41 @@ export default function Home() {
 
           <div className="grid">
             <Card title="Fecha de expiración" status={expirationStatus(data.expiration)}>
+              {data.expiration.ok && data.expiration.expiration ? (
+                <>
+                  <p className="big">{formatDate(data.expiration.expiration.date)}</p>
+                  <p className="muted">
+                    {data.expiration.expiration.daysLeft < 0
+                      ? "Este dominio ya expiró"
+                      : `Faltan ${data.expiration.expiration.daysLeft} días`}
+                  </p>
+                </>
+              ) : (
+                <p className="muted">
+                  {data.expiration.ok
+                    ? "No se encontró fecha de expiración vía RDAP"
+                    : data.expiration.error}
+                </p>
+              )}
+            </Card>
+
+            <Card
+              title="Registro del dominio"
+              status={data.expiration.ok ? "neutral" : "critical"}
+            >
               {data.expiration.ok ? (
                 <>
-                  <p className="big">{formatDate(data.expiration.date)}</p>
                   <p className="muted">
-                    {data.expiration.daysLeft < 0
-                      ? "Este dominio ya expiró"
-                      : `Faltan ${data.expiration.daysLeft} días`}
+                    <strong>Registrado:</strong>{" "}
+                    {data.expiration.registered
+                      ? formatDate(data.expiration.registered.date)
+                      : "No disponible"}
+                  </p>
+                  <p className="muted">
+                    <strong>Última modificación:</strong>{" "}
+                    {data.expiration.lastChanged
+                      ? formatDate(data.expiration.lastChanged.date)
+                      : "No disponible"}
                   </p>
                 </>
               ) : (
