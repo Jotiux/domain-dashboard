@@ -9,7 +9,6 @@ import {
   getSpf,
   getDmarc,
   getBlacklists,
-  getMxBlacklist,
   isValidDomain,
 } from "../../lib/checks";
 
@@ -79,17 +78,12 @@ export default async function handler(req, res) {
   }
 
   try {
-    // El MX se resuelve primero porque la verificación de Spamhaus ZEN
-    // necesita sus servidores para revisar la IP de cada uno.
-    const mx = await getMx(domain);
-    const mxHosts = mx.ok ? mx.top2 : [];
-
-    const [expiration, spf, dmarc, blacklists, mxBlacklist] = await Promise.all([
+    const [expiration, mx, spf, dmarc, blacklists] = await Promise.all([
       getExpiration(domain),
+      getMx(domain),
       getSpf(domain),
       getDmarc(domain),
       getBlacklists(domain),
-      getMxBlacklist(mxHosts),
     ]);
 
     // Cache corto en el borde de Vercel: si dos personas consultan el mismo
@@ -107,7 +101,6 @@ export default async function handler(req, res) {
       spf,
       dmarc,
       blacklists,
-      mxBlacklist,
     });
   } catch (err) {
     return res.status(500).json({
