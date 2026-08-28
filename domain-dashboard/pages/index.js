@@ -263,22 +263,33 @@ export default function Home() {
               </ul>
 
               <p className="muted" style={{ marginTop: 10, marginBottom: 2 }}>
-                <strong>Del servidor de correo (Spamhaus ZEN):</strong>
+                <strong>Del servidor de correo (por IP):</strong>
               </p>
               {data.mxBlacklist && data.mxBlacklist.results.length > 0 ? (
-                <ul className="list">
-                  {data.mxBlacklist.results.map((r) => (
-                    <li key={r.host}>
+                data.mxBlacklist.results.map((r) => (
+                  <div key={r.host} style={{ marginBottom: 6 }}>
+                    <p className="muted" style={{ marginBottom: 2 }}>
                       {r.host}
-                      {r.ip ? ` (${r.ip})` : ""}:{" "}
-                      {r.listed === true
-                        ? "❌ Listado"
-                        : r.listed === false
-                        ? "✅ Limpio"
-                        : "⚠️ No se pudo verificar"}
-                    </li>
-                  ))}
-                </ul>
+                      {r.ip ? ` (${r.ip})` : ""}
+                    </p>
+                    {r.checks && r.checks.length > 0 ? (
+                      <ul className="list">
+                        {r.checks.map((c) => (
+                          <li key={c.name}>
+                            {c.name}:{" "}
+                            {c.listed === true
+                              ? "❌ Listado"
+                              : c.listed === false
+                              ? "✅ Limpio"
+                              : "⚠️ No se pudo verificar"}
+                          </li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <p className="muted">{r.error}</p>
+                    )}
+                  </div>
+                ))
               ) : (
                 <p className="muted">No hay servidores MX que revisar</p>
               )}
