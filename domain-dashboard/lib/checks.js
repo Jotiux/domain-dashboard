@@ -20,48 +20,143 @@ function withTimeout(promise, ms, timeoutMessage) {
   ]);
 }
 
-// --- Fecha de expiración (vía RDAP, el reemplazo moderno y gratuito de WHOIS) ---
-export async function getExpiration(domain) {
-  try {
-    const res = await withTimeout(
-      fetch(`https://rdap.org/domain/${encodeURIComponent(domain)}`, {
-        headers: { Accept: "application/rdap+json" },
-      }),
-      8000,
-      "RDAP tardó demasiado en responder"
-    );
+// --- Información RDAP: expiración, fecha de registro y última modificación ---
+//
+// rdap.org es un proxy público cómodo, pero para algunos TLDs (sobre todo
+// ccTLDs como .ec) puede ser lento o no encontrar el registro correcto.
+// Para mejorar la confiabilidad, consultamos EN PARALELO:
+//   1) el servidor RDAP oficial del registro de ese TLD (según el
+//      "bootstrap" público que publica IANA), y
+//   2) el proxy rdap.org como respaldo.
+// Nos quedamos con la primera respuesta exitosa; si ambas fallan, mostramos
+// el último error recibido.
 
-    if (res.status === 404) {
-      return { ok: false, error: "El dominio no existe o no está registrado" };
+let rdapBootstrapCache = null;
+let rdapBootstrapFetchedAt = 0;
+const RDAP_BOOTSTRAP_TTL = 6 * 60 * 60 * 1000; // 6 horas
+
+// Descubre cuál es el servidor RDAP "oficial" de un TLD, usando el índice
+// que publica IANA (data.iana.org/rdap/dns.json). Se cachea en memoria
+// mientras la función serverless siga "caliente" para no pedirlo cada vez.
+async function getNativeRdapBase(tld) {
+  const now = Date.now();
+  if (!rdapBootstrapCache || now - rdapBootstrapFetchedAt > RDAP_BOOTSTRAP_TTL) {
+    try {
+      const res = await withTimeout(
+        fetch("https://data.iana.org/rdap/dns.json"),
+        5000,
+        "bootstrap RDAP tardó demasiado"
+      );
+      if (res.ok) {
+        rdapBootstrapCache = await res.json();
+        rdapBootstrapFetchedAt = now;
+      }
+    } catch {
+      // Si falla, seguimos sin servidor nativo; el proxy rdap.org sigue
+      // intentando de todas formas.
     }
-    if (!res.ok) {
-      return { ok: false, error: `RDAP respondió con estado ${res.status}` };
-    }
-
-    const data = await res.json();
-    const events = Array.isArray(data.events) ? data.events : [];
-    const expirationEvent = events.find(
-      (e) => e.eventAction === "expiration"
-    );
-
-    if (!expirationEvent || !expirationEvent.eventDate) {
-      return {
-        ok: false,
-        error: "El registrador no publica la fecha de expiración vía RDAP",
-      };
-    }
-
-    const date = new Date(expirationEvent.eventDate);
-    const daysLeft = Math.ceil((date.getTime() - Date.now()) / 86400000);
-
-    return {
-      ok: true,
-      date: expirationEvent.eventDate,
-      daysLeft,
-    };
-  } catch (err) {
-    return { ok: false, error: "No se pudo consultar RDAP: " + err.message };
   }
+
+  const services = rdapBootstrapCache?.services || [];
+  const entry = services.find(([tlds]) => tlds.includes(tld));
+  return entry ? entry[1][0] : null;
+}
+
+function toDatedEvent(event) {
+  if (!event || !event.eventDate) return null;
+  const daysLeft = Math.ceil(
+    (new Date(event.eventDate).getTime() - Date.now()) / 86400000
+  );
+  return { date: event.eventDate, daysLeft };
+}
+
+function parseRdapDocument(data) {
+  const events = Array.isArray(data.events) ? data.events : [];
+  const findEvent = (action) => events.find((e) => e.eventAction === action);
+
+  const expiration = toDatedEvent(findEvent("expiration"));
+  const registered = toDatedEvent(findEvent("registration"));
+  const lastChangedEvent = findEvent("last changed");
+  const lastChanged = lastChangedEvent
+    ? { date: lastChangedEvent.eventDate }
+    : null;
+
+  if (!expiration && !registered && !lastChanged) {
+    return {
+      ok: false,
+      error: "El registrador no publica fechas vía RDAP para este dominio",
+    };
+  }
+
+  return { ok: true, expiration, registered, lastChanged };
+}
+
+async function fetchRdap(url) {
+  const res = await fetch(url, {
+    headers: { Accept: "application/rdap+json" },
+  });
+  if (res.status === 404) {
+    return { ok: false, error: "El dominio no existe o no está registrado" };
+  }
+  if (!res.ok) {
+    return { ok: false, error: `RDAP respondió con estado ${res.status}` };
+  }
+  const data = await res.json();
+  return parseRdapDocument(data);
+}
+
+// Se queda con la primera respuesta exitosa (ok:true); si todas fallan,
+// resuelve con el último resultado (fallido) recibido.
+function raceForSuccess(promises) {
+  return new Promise((resolve) => {
+    let remaining = promises.length;
+    let lastResult = { ok: false, error: "No se pudo consultar RDAP" };
+    promises.forEach((p) => {
+      p.then((result) => {
+        lastResult = result;
+        if (result.ok) resolve(result);
+        remaining -= 1;
+        if (remaining === 0) resolve(lastResult);
+      });
+    });
+  });
+}
+
+export async function getExpiration(domain) {
+  const tld = domain.split(".").pop();
+
+  const nativeAttempt = (async () => {
+    try {
+      const base = await getNativeRdapBase(tld);
+      if (!base) {
+        return { ok: false, error: `El TLD .${tld} no publica un servidor RDAP propio en IANA` };
+      }
+      const url = base.endsWith("/")
+        ? `${base}domain/${domain}`
+        : `${base}/domain/${domain}`;
+      return await withTimeout(
+        fetchRdap(url),
+        7000,
+        "El servidor RDAP del registro tardó demasiado"
+      );
+    } catch (err) {
+      return { ok: false, error: "RDAP del registro falló: " + err.message };
+    }
+  })();
+
+  const proxyAttempt = (async () => {
+    try {
+      return await withTimeout(
+        fetchRdap(`https://rdap.org/domain/${encodeURIComponent(domain)}`),
+        7000,
+        "rdap.org tardó demasiado en responder"
+      );
+    } catch (err) {
+      return { ok: false, error: "No se pudo consultar rdap.org: " + err.message };
+    }
+  })();
+
+  return raceForSuccess([nativeAttempt, proxyAttempt]);
 }
 
 // --- Registros MX ---
