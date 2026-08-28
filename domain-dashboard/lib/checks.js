@@ -70,6 +70,81 @@ function toDatedEvent(event) {
   return { date: event.eventDate, daysLeft };
 }
 
+// Los datos de "quién es el registrador" vienen en formato vCard dentro de
+// cada entidad RDAP: ["vcard", [ ["fn", {}, "text", "GoDaddy.com, LLC"], ... ]]
+function findVcardValue(vcardArray, property) {
+  if (!Array.isArray(vcardArray) || !Array.isArray(vcardArray[1])) return null;
+  const field = vcardArray[1].find(
+    (f) => Array.isArray(f) && f[0] === property
+  );
+  return field && typeof field[3] === "string" ? field[3] : null;
+}
+
+function getRegistrarName(data) {
+  const entities = Array.isArray(data.entities) ? data.entities : [];
+  const registrarEntity = entities.find(
+    (e) => Array.isArray(e.roles) && e.roles.includes("registrar")
+  );
+  if (!registrarEntity) return null;
+  return findVcardValue(registrarEntity.vcardArray, "fn");
+}
+
+// Heurística simple: identifica al proveedor de DNS a partir del hostname
+// del servidor de nombres. No es una lista exhaustiva, pero cubre los
+// proveedores más comunes; si no reconoce el patrón, devuelve null.
+const NS_PROVIDER_PATTERNS = [
+  [/\.cloudflare\.com$/i, "Cloudflare"],
+  [/awsdns/i, "Amazon Route 53 (AWS)"],
+  [/\.domaincontrol\.com$/i, "GoDaddy"],
+  [/\.googledomains\.com$|\.google\.com$/i, "Google"],
+  [/\.azure-dns\./i, "Microsoft Azure DNS"],
+  [/\.dnsmadeeasy\.com$/i, "DNS Made Easy"],
+  [/\.digitalocean\.com$/i, "DigitalOcean"],
+  [/\.registrar-servers\.com$/i, "Namecheap"],
+  [/\.cloudns\./i, "ClouDNS"],
+  [/\.hostgator\.com$/i, "HostGator"],
+  [/\.dreamhost\.com$/i, "DreamHost"],
+  [/\.telconet\./i, "Telconet"],
+  [/\.nic\.ec$/i, "NIC.EC"],
+  [/\.ovh\.net$/i, "OVH"],
+  [/\.dnsimple\.com$/i, "DNSimple"],
+  [/\.name\.com$/i, "Name.com"],
+];
+
+function detectNsProvider(hostname) {
+  const match = NS_PROVIDER_PATTERNS.find(([re]) => re.test(hostname));
+  return match ? match[1] : null;
+}
+
+function getNameservers(data) {
+  const list = Array.isArray(data.nameservers) ? data.nameservers : [];
+  return list
+    .map((ns) => ns.ldhName)
+    .filter(Boolean)
+    .map((host) => ({ host, provider: detectNsProvider(host) }));
+}
+
+// Traduce los códigos de estado RDAP más comunes a algo entendible; deja el
+// resto tal cual (en inglés) para no perder información.
+const STATUS_LABELS = {
+  active: "Activo",
+  "client transfer prohibited": "Protegido contra transferencias no autorizadas",
+  "client delete prohibited": "Protegido contra eliminación",
+  "client update prohibited": "Protegido contra modificaciones",
+  "client hold": "En espera (clientHold) — puede no resolver",
+  "server transfer prohibited": "Bloqueado por el registro contra transferencias",
+  "server delete prohibited": "Bloqueado por el registro contra eliminación",
+  "server update prohibited": "Bloqueado por el registro contra modificaciones",
+  "pending delete": "Pendiente de eliminación",
+  "pending transfer": "Pendiente de transferencia",
+  "redemption period": "En periodo de recuperación (a punto de liberarse)",
+};
+
+function getStatusLabels(data) {
+  const raw = Array.isArray(data.status) ? data.status : [];
+  return raw.map((s) => STATUS_LABELS[s] || s);
+}
+
 function parseRdapDocument(data) {
   const events = Array.isArray(data.events) ? data.events : [];
   const findEvent = (action) => events.find((e) => e.eventAction === action);
@@ -81,6 +156,10 @@ function parseRdapDocument(data) {
     ? { date: lastChangedEvent.eventDate }
     : null;
 
+  const registrar = getRegistrarName(data);
+  const nameservers = getNameservers(data);
+  const statusLabels = getStatusLabels(data);
+
   if (!expiration && !registered && !lastChanged) {
     return {
       ok: false,
@@ -88,7 +167,15 @@ function parseRdapDocument(data) {
     };
   }
 
-  return { ok: true, expiration, registered, lastChanged };
+  return {
+    ok: true,
+    expiration,
+    registered,
+    lastChanged,
+    registrar,
+    nameservers,
+    status: statusLabels,
+  };
 }
 
 async function fetchRdap(url) {
@@ -299,6 +386,72 @@ export async function getBlacklists(domain) {
     results,
     isListed: listedIn.length > 0,
     listedIn,
+    hasUncertain: uncertain.length > 0,
+  };
+}
+
+// --- Spamhaus ZEN sobre la IP del servidor de correo (MX) ---
+// A diferencia de Spamhaus DBL/SURBL (que revisan el DOMINIO), ZEN revisa la
+// IP real del servidor que entrega el correo — es la comprobación que usan
+// las herramientas profesionales de entregabilidad, porque un dominio puede
+// verse "limpio" y aun así su servidor de correo estar en una IP marcada
+// como fuente de spam.
+async function checkZenForIp(ip) {
+  try {
+    const reversed = ip.split(".").reverse().join(".");
+    await withTimeout(
+      dnsPromises.resolve4(`${reversed}.zen.spamhaus.org`),
+      7000,
+      "timeout"
+    );
+    return { listed: true };
+  } catch (err) {
+    if (err.code === "ENOTFOUND" || err.code === "ENODATA") {
+      return { listed: false };
+    }
+    return { listed: null, error: err.code || err.message };
+  }
+}
+
+// Recibe la lista de servidores MX (host + prioridad) que ya obtuvimos con
+// getMx(), resuelve su IP y consulta Spamhaus ZEN para cada una.
+export async function getMxBlacklist(mxHosts) {
+  if (!Array.isArray(mxHosts) || mxHosts.length === 0) {
+    return { ok: true, results: [], isListed: false, hasUncertain: false };
+  }
+
+  const results = [];
+  for (const { host } of mxHosts) {
+    try {
+      const ips = await withTimeout(
+        dnsPromises.resolve4(host),
+        6000,
+        "timeout"
+      );
+      const ip = ips[0];
+      if (!ip) {
+        results.push({ host, ip: null, listed: null, error: "Sin IPv4" });
+        continue;
+      }
+      const r = await checkZenForIp(ip);
+      results.push({ host, ip, ...r });
+    } catch (err) {
+      results.push({
+        host,
+        ip: null,
+        listed: null,
+        error: "No se pudo resolver la IP de este servidor",
+      });
+    }
+  }
+
+  const listed = results.filter((r) => r.listed === true);
+  const uncertain = results.filter((r) => r.listed === null);
+
+  return {
+    ok: true,
+    results,
+    isListed: listed.length > 0,
     hasUncertain: uncertain.length > 0,
   };
 }
