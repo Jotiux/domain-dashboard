@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { useRouter } from "next/router";
 
 // --- Helpers para decidir el color/estado de cada tarjeta ---
 // Usamos una paleta de estado fija: good (verde), warning (amarillo),
@@ -22,6 +23,12 @@ function dmarcStatus(dmarc) {
   if (!dmarc.ok) return "critical";
   if (dmarc.policy === "reject" || dmarc.policy === "quarantine") return "good";
   if (dmarc.policy === "none") return "warning";
+  return "good";
+}
+
+function blacklistStatus(blacklists, mxBlacklist) {
+  if (blacklists.isListed || (mxBlacklist && mxBlacklist.isListed)) return "critical";
+  if (blacklists.hasUncertain || (mxBlacklist && mxBlacklist.hasUncertain)) return "neutral";
   return "good";
 }
 
@@ -59,19 +66,22 @@ function formatDate(iso) {
 }
 
 export default function Home() {
+  const router = useRouter();
   const [domain, setDomain] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [data, setData] = useState(null);
+  const [copied, setCopied] = useState(false);
+  const autoSearchedRef = useRef(false);
 
-  async function handleSearch(e) {
-    e.preventDefault();
-    const clean = domain.trim();
+  async function runSearch(value) {
+    const clean = value.trim();
     if (!clean) return;
 
     setLoading(true);
     setError("");
     setData(null);
+    setCopied(false);
 
     try {
       const res = await fetch(`/api/lookup?domain=${encodeURIComponent(clean)}`);
@@ -81,6 +91,13 @@ export default function Home() {
         setError(json.error || "No se pudo consultar el dominio");
       } else {
         setData(json);
+        // Actualiza la URL (?domain=...) sin recargar la página, para que
+        // el resultado se pueda compartir con un link directo.
+        router.replace(
+          { pathname: "/", query: { domain: json.domain } },
+          undefined,
+          { shallow: true }
+        );
       }
     } catch (err) {
       setError("No se pudo conectar con el servidor. Intenta de nuevo.");
@@ -89,14 +106,42 @@ export default function Home() {
     }
   }
 
+  function handleSearch(e) {
+    e.preventDefault();
+    runSearch(domain);
+  }
+
+  // Si alguien abre un link tipo /?domain=ejemplo.com, precargamos el campo
+  // y lanzamos la búsqueda automáticamente una sola vez.
+  useEffect(() => {
+    if (!router.isReady || autoSearchedRef.current) return;
+    const fromUrl = router.query.domain;
+    if (typeof fromUrl === "string" && fromUrl.trim()) {
+      autoSearchedRef.current = true;
+      setDomain(fromUrl);
+      runSearch(fromUrl);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [router.isReady]);
+
+  function handleCopyLink() {
+    if (!data) return;
+    const url = `${window.location.origin}/?domain=${encodeURIComponent(data.domain)}`;
+    navigator.clipboard
+      .writeText(url)
+      .then(() => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
+      })
+      .catch(() => {
+        setError("No se pudo copiar el link automáticamente. Cópialo desde la barra del navegador.");
+      });
+  }
+
   return (
     <div className="page">
       <header className="hero">
         <h1>Consulta y Análisis de Dominios</h1>
-        <p className="subtitle">
-          Escribe un dominio y obtén en segundos su expiración, listas negras,
-          servidores de correo (MX), SPF y DMARC — todo en un solo lugar.
-        </p>
 
         <form className="search-bar" onSubmit={handleSearch}>
           <input
@@ -120,6 +165,10 @@ export default function Home() {
         <main className="results">
           <p className="results-meta">
             Resultados para <strong>{data.domain}</strong>
+            {" · "}
+            <button type="button" className="link-button" onClick={handleCopyLink}>
+              {copied ? "¡Enlace copiado!" : "Copiar enlace para compartir"}
+            </button>
           </p>
 
           <div className="grid">
@@ -160,6 +209,33 @@ export default function Home() {
                       ? formatDate(data.expiration.lastChanged.date)
                       : "No disponible"}
                   </p>
+                  <p className="muted">
+                    <strong>Registrador:</strong>{" "}
+                    {data.expiration.registrar || "No disponible"}
+                  </p>
+                  {data.expiration.status && data.expiration.status.length > 0 && (
+                    <p className="muted">
+                      <strong>Estado:</strong> {data.expiration.status.join(", ")}
+                    </p>
+                  )}
+                  {data.expiration.nameservers &&
+                    data.expiration.nameservers.length > 0 && (
+                      <>
+                        <p className="muted" style={{ marginBottom: 2 }}>
+                          <strong>Servidores de nombres (NS):</strong>
+                        </p>
+                        <ul className="list">
+                          {data.expiration.nameservers.map((ns) => (
+                            <li key={ns.host}>
+                              {ns.host}
+                              {ns.provider && (
+                                <span className="muted"> — {ns.provider}</span>
+                              )}
+                            </li>
+                          ))}
+                        </ul>
+                      </>
+                    )}
                 </>
               ) : (
                 <p className="muted">{data.expiration.error}</p>
@@ -168,14 +244,11 @@ export default function Home() {
 
             <Card
               title="Listas negras (Blacklists)"
-              status={
-                data.blacklists.isListed
-                  ? "critical"
-                  : data.blacklists.hasUncertain
-                  ? "neutral"
-                  : "good"
-              }
+              status={blacklistStatus(data.blacklists, data.mxBlacklist)}
             >
+              <p className="muted" style={{ marginBottom: 2 }}>
+                <strong>Del dominio:</strong>
+              </p>
               <ul className="list">
                 {data.blacklists.results.map((r) => (
                   <li key={r.name}>
@@ -188,6 +261,27 @@ export default function Home() {
                   </li>
                 ))}
               </ul>
+
+              <p className="muted" style={{ marginTop: 10, marginBottom: 2 }}>
+                <strong>Del servidor de correo (Spamhaus ZEN):</strong>
+              </p>
+              {data.mxBlacklist && data.mxBlacklist.results.length > 0 ? (
+                <ul className="list">
+                  {data.mxBlacklist.results.map((r) => (
+                    <li key={r.host}>
+                      {r.host}
+                      {r.ip ? ` (${r.ip})` : ""}:{" "}
+                      {r.listed === true
+                        ? "❌ Listado"
+                        : r.listed === false
+                        ? "✅ Limpio"
+                        : "⚠️ No se pudo verificar"}
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="muted">No hay servidores MX que revisar</p>
+              )}
             </Card>
 
             <Card
