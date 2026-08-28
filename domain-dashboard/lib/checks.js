@@ -385,10 +385,13 @@ async function checkZone(query) {
 }
 
 // Listas que revisan el DOMINIO en sí.
-const DOMAIN_BLACKLIST_ZONES = [
-  { name: "Spamhaus DBL", zone: "dbl.spamhaus.org" },
-  { name: "SURBL", zone: "multi.surbl.org" },
-];
+//
+// Spamhaus DBL queda fuera a propósito: su mirror público bloquea con
+// frecuencia las consultas que vienen de infraestructura compartida en la
+// nube (como Vercel), así que casi siempre respondería "no se pudo
+// verificar" — no aporta nada y puede parecer que algo está roto. SURBL no
+// tiene esa restricción y sí responde de forma confiable.
+const DOMAIN_BLACKLIST_ZONES = [{ name: "SURBL", zone: "multi.surbl.org" }];
 
 export async function getBlacklists(domain) {
   const results = await Promise.all(
@@ -410,72 +413,10 @@ export async function getBlacklists(domain) {
   };
 }
 
-// --- Listas negras sobre la IP del servidor de correo (MX) ---
-// A diferencia de Spamhaus DBL/SURBL (que revisan el DOMINIO), estas revisan
-// la IP real del servidor que entrega el correo — el mismo enfoque que usa
-// MXToolbox, porque un dominio puede verse "limpio" y aun así su servidor de
-// correo estar en una IP marcada como fuente de spam.
-const IP_BLACKLIST_ZONES = [
-  { name: "Spamhaus ZEN", zone: "zen.spamhaus.org" },
-  { name: "Barracuda (BRBL)", zone: "b.barracudacentral.org" },
-  { name: "UCEPROTECT L1", zone: "dnsbl-1.uceprotect.net" },
-];
-
-async function checkIpZone(ip, zone) {
-  const reversed = ip.split(".").reverse().join(".");
-  return checkZone(`${reversed}.${zone}`);
-}
-
-// Recibe la lista de servidores MX (host + prioridad) que ya obtuvimos con
-// getMx(), resuelve su IP y la consulta contra cada lista de IP\_BLACKLIST\_ZONES.
-export async function getMxBlacklist(mxHosts) {
-  if (!Array.isArray(mxHosts) || mxHosts.length === 0) {
-    return { ok: true, results: [], isListed: false, hasUncertain: false };
-  }
-
-  const results = [];
-  for (const { host } of mxHosts) {
-    let ip = null;
-    try {
-      const ips = await withTimeout(dnsPromises.resolve4(host), 6000, "timeout");
-      ip = ips[0] || null;
-    } catch {
-      // se maneja abajo (ip queda null)
-    }
-
-    if (!ip) {
-      results.push({
-        host,
-        ip: null,
-        checks: [],
-        listed: null,
-        error: "No se pudo resolver la IP de este servidor",
-      });
-      continue;
-    }
-
-    const checks = await Promise.all(
-      IP_BLACKLIST_ZONES.map(async (bl) => {
-        const r = await checkIpZone(ip, bl.zone);
-        return { name: bl.name, ...r };
-      })
-    );
-
-    results.push({
-      host,
-      ip,
-      checks,
-      listed: checks.some((c) => c.listed === true),
-    });
-  }
-
-  const listed = results.some((r) => r.listed === true);
-  const hasUncertain = results.some((r) =>
-    r.checks?.some((c) => c.listed === null)
-  );
-
-  return { ok: true, results, isListed: listed, hasUncertain };
-}
+// Nota para más adelante: se evaluó revisar también las IPs de envío de
+// correo (por ejemplo las declaradas en el SPF) contra listas negras
+// basadas en IP, pero se dejó pendiente a propósito — se retoma cuando el
+// resto del dashboard esté más maduro.
 
 // Validación simple de dominio antes de consultar nada.
 export function isValidDomain(domain) {
