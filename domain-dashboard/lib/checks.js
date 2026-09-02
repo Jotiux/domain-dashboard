@@ -246,14 +246,67 @@ export async function getExpiration(domain) {
   return raceForSuccess([nativeAttempt, proxyAttempt]);
 }
 
+// --- TTL vía DNS-over-HTTPS (Google) ---
+// Node no expone el TTL de registros MX/TXT de forma nativa (dns.promises
+// solo lo da para A/AAAA con la opción {ttl:true}). Para no depender de
+// librerías extra, usamos la API pública y gratuita de DNS-over-HTTPS de
+// Google, que sí devuelve el TTL tal cual lo entrega el DNS del dominio.
+// Si esta consulta falla por cualquier motivo, simplemente no mostramos el
+// TTL — nunca rompe el resto de la información ya obtenida por vía normal.
+const DOH_TYPE_NUMBERS = { MX: 15, TXT: 16 };
+
+async function queryDoh(name, type) {
+  try {
+    const typeNumber = DOH_TYPE_NUMBERS[type];
+    const res = await withTimeout(
+      fetch(
+        `https://dns.google/resolve?name=${encodeURIComponent(name)}&type=${type}`,
+        { headers: { Accept: "application/dns-json" } }
+      ),
+      5000,
+      "Consulta DoH tardó demasiado"
+    );
+    if (!res.ok) return [];
+    const data = await res.json();
+    const answers = Array.isArray(data.Answer) ? data.Answer : [];
+    return answers.filter((a) => a.type === typeNumber);
+  } catch {
+    return [];
+  }
+}
+
+function findTtlForHost(dohAnswers, hostname) {
+  const target = hostname.replace(/\.$/, "").toLowerCase();
+  // La respuesta MX de DoH viene como "10 mx1.example.com." (prioridad y host).
+  const match = dohAnswers.find((a) => {
+    const parts = a.data.split(" ");
+    const host = (parts[1] || parts[0] || "").replace(/\.$/, "").toLowerCase();
+    return host === target;
+  });
+  return match ? match.TTL : null;
+}
+
+function normalizeForMatch(s) {
+  return s.replace(/^"|"$/g, "").replace(/"\s*"/g, "").replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function findTtlForTxt(dohAnswers, recordText) {
+  const target = normalizeForMatch(recordText);
+  const match = dohAnswers.find((a) => normalizeForMatch(a.data) === target);
+  return match ? match.TTL : null;
+}
+
 // --- Registros MX ---
 export async function getMx(domain) {
   try {
-    const records = await withTimeout(
-      dnsPromises.resolveMx(domain),
-      8000,
-      "Consulta MX tardó demasiado"
-    );
+    const [records, dohAnswers] = await Promise.all([
+      withTimeout(
+        dnsPromises.resolveMx(domain),
+        8000,
+        "Consulta MX tardó demasiado"
+      ),
+      queryDoh(domain, "MX"),
+    ]);
     const sorted = [...records].sort((a, b) => a.priority - b.priority);
 
     // RFC 7505: un único registro "0 ." (exchange vacío/".") significa que
@@ -272,11 +325,11 @@ export async function getMx(domain) {
     return {
       ok: true,
       total: sorted.length,
-      top2: sorted.slice(0, 2).map((r) => ({
+      records: sorted.map((r) => ({
         host: r.exchange,
         priority: r.priority,
+        ttl: findTtlForHost(dohAnswers, r.exchange),
       })),
-      hasMoreThanTwo: sorted.length > 2,
     };
   } catch (err) {
     return {
@@ -292,18 +345,21 @@ export async function getMx(domain) {
 // --- SPF (registro TXT en la raíz del dominio) ---
 export async function getSpf(domain) {
   try {
-    const records = await withTimeout(
-      dnsPromises.resolveTxt(domain),
-      8000,
-      "Consulta SPF tardó demasiado"
-    );
+    const [records, dohAnswers] = await Promise.all([
+      withTimeout(
+        dnsPromises.resolveTxt(domain),
+        8000,
+        "Consulta SPF tardó demasiado"
+      ),
+      queryDoh(domain, "TXT"),
+    ]);
     const flat = records.map((chunks) => chunks.join(""));
     const spf = flat.find((r) => r.toLowerCase().startsWith("v=spf1"));
 
     if (!spf) {
       return { ok: false, error: "No se encontró registro SPF" };
     }
-    return { ok: true, record: spf };
+    return { ok: true, record: spf, ttl: findTtlForTxt(dohAnswers, spf) };
   } catch (err) {
     return {
       ok: false,
@@ -318,11 +374,14 @@ export async function getSpf(domain) {
 // --- DMARC (registro TXT en _dmarc.dominio) ---
 export async function getDmarc(domain) {
   try {
-    const records = await withTimeout(
-      dnsPromises.resolveTxt(`_dmarc.${domain}`),
-      8000,
-      "Consulta DMARC tardó demasiado"
-    );
+    const [records, dohAnswers] = await Promise.all([
+      withTimeout(
+        dnsPromises.resolveTxt(`_dmarc.${domain}`),
+        8000,
+        "Consulta DMARC tardó demasiado"
+      ),
+      queryDoh(`_dmarc.${domain}`, "TXT"),
+    ]);
     const flat = records.map((chunks) => chunks.join(""));
     const dmarc = flat.find((r) => r.toLowerCase().startsWith("v=dmarc1"));
 
@@ -333,7 +392,12 @@ export async function getDmarc(domain) {
     const policyMatch = dmarc.match(/p=([a-zA-Z]+)/i);
     const policy = policyMatch ? policyMatch[1].toLowerCase() : null;
 
-    return { ok: true, record: dmarc, policy };
+    return {
+      ok: true,
+      record: dmarc,
+      policy,
+      ttl: findTtlForTxt(dohAnswers, dmarc),
+    };
   } catch (err) {
     return {
       ok: false,
@@ -343,6 +407,223 @@ export async function getDmarc(domain) {
           : "No se pudo consultar DMARC: " + (err.code || err.message),
     };
   }
+}
+
+// --- Validación de sintaxis de SPF ---
+// No es un parser 100% conforme al RFC 7208, pero detecta los errores y
+// malas prácticas más comunes: mecanismos mal escritos, IPs inválidas,
+// exceso del límite de 10 "lookups" DNS (la causa más frecuente de que un
+// SPF falle silenciosamente), y falta del calificador "all" final.
+const SPF_QUALIFIERS = new Set(["+", "-", "~", "?"]);
+
+function isValidIPv4WithPrefix(value) {
+  const [ip, prefix] = value.split("/");
+  const octets = ip.split(".");
+  if (octets.length !== 4) return false;
+  if (!octets.every((o) => /^\d{1,3}$/.test(o) && Number(o) <= 255)) return false;
+  if (prefix !== undefined && (!/^\d{1,2}$/.test(prefix) || Number(prefix) > 32)) {
+    return false;
+  }
+  return true;
+}
+
+function isValidIPv6WithPrefix(value) {
+  const [ip, prefix] = value.split("/");
+  if (!ip.includes(":") || !/^[0-9a-fA-F:]+$/.test(ip)) return false;
+  if (prefix !== undefined && (!/^\d{1,3}$/.test(prefix) || Number(prefix) > 128)) {
+    return false;
+  }
+  return true;
+}
+
+function isValidDomainToken(value) {
+  return value === "" || /^[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?$/.test(value);
+}
+
+export function validateSpfSyntax(record) {
+  const errors = [];
+  const warnings = [];
+  if (!record) return { errors, warnings };
+
+  const terms = record.trim().split(/\s+/);
+  const version = terms.shift();
+
+  if (version !== "v=spf1") {
+    errors.push(`Debe empezar exactamente con "v=spf1" (se encontró "${version}")`);
+  }
+
+  let lookupCount = 0;
+  let hasAll = false;
+
+  terms.forEach((term, idx) => {
+    let qualifier = "+";
+    let rest = term;
+    if (SPF_QUALIFIERS.has(term[0])) {
+      qualifier = term[0];
+      rest = term.slice(1);
+    }
+
+    if (rest === "all") {
+      hasAll = true;
+      if (qualifier === "+") {
+        warnings.push(
+          '"+all" permite que CUALQUIER servidor envíe correo en nombre del dominio — muy inseguro, se recomienda "-all" o "~all".'
+        );
+      }
+      if (idx !== terms.length - 1) {
+        warnings.push('"all" debería ser el último término; lo que va después se ignora.');
+      }
+      return;
+    }
+
+    const sep = rest.includes(":") ? ":" : rest.includes("=") ? "=" : null;
+    const mechanism = sep ? rest.slice(0, rest.indexOf(sep)) : rest;
+    const value = sep ? rest.slice(rest.indexOf(sep) + 1) : null;
+
+    switch (mechanism) {
+      case "ip4":
+        if (!value || !isValidIPv4WithPrefix(value)) {
+          errors.push(`"${term}" no es una IPv4 válida`);
+        }
+        break;
+      case "ip6":
+        if (!value || !isValidIPv6WithPrefix(value)) {
+          errors.push(`"${term}" no es una IPv6 válida`);
+        }
+        break;
+      case "a":
+      case "mx":
+        lookupCount++;
+        if (value && !isValidDomainToken(value.split("/")[0])) {
+          errors.push(`"${term}" tiene un dominio con formato inválido`);
+        }
+        break;
+      case "ptr":
+        lookupCount++;
+        warnings.push('El mecanismo "ptr" está desaconsejado (lento y poco confiable) — mejor evitarlo.');
+        break;
+      case "include":
+        lookupCount++;
+        if (!value) errors.push(`"include:" necesita un dominio, ej. include:otrodominio.com`);
+        break;
+      case "exists":
+        lookupCount++;
+        if (!value) errors.push(`"exists:" necesita un dominio`);
+        break;
+      case "redirect":
+        lookupCount++;
+        if (!value) errors.push(`"redirect=" necesita un dominio`);
+        break;
+      case "exp":
+        break;
+      default:
+        errors.push(`Mecanismo no reconocido: "${term}"`);
+    }
+  });
+
+  if (!hasAll) {
+    warnings.push(
+      'No se encontró un mecanismo "all" al final — se recomienda terminar el registro con "-all" o "~all".'
+    );
+  }
+
+  if (lookupCount > 10) {
+    errors.push(
+      `Usa ${lookupCount} mecanismos que requieren consulta DNS (a, mx, include, ptr, exists, redirect) — el límite es 10. Superarlo hace que el SPF falle ("permerror") para quien lo evalúe. Si algún "include" trae mecanismos anidados, el total real podría ser aún mayor.`
+    );
+  } else if (lookupCount >= 8) {
+    warnings.push(
+      `Usa ${lookupCount} de los 10 mecanismos de consulta DNS permitidos — está cerca del límite (los "include" pueden sumar más consultas anidadas que no se cuentan aquí).`
+    );
+  }
+
+  return { errors, warnings };
+}
+
+// --- Validación de sintaxis de DMARC ---
+const DMARC_POLICY_VALUES = new Set(["none", "quarantine", "reject"]);
+const DMARC_ALIGNMENT_VALUES = new Set(["r", "s"]);
+const DMARC_KNOWN_TAGS = new Set([
+  "v", "p", "sp", "rua", "ruf", "adkim", "aspf", "pct", "fo", "rf", "ri", "psd", "np",
+]);
+
+function isValidMailtoList(value) {
+  const clean = value.replace(/!\d+[kmgt]?/gi, "");
+  return clean
+    .split(",")
+    .map((v) => v.trim())
+    .every((v) => /^mailto:[^\s@]+@[^\s@]+\.[^\s@]+$/i.test(v));
+}
+
+export function validateDmarcSyntax(record) {
+  const errors = [];
+  const warnings = [];
+  if (!record) return { errors, warnings };
+
+  const rawTags = record.split(";").map((t) => t.trim()).filter(Boolean);
+  const tags = {};
+
+  if (!rawTags[0] || !rawTags[0].toLowerCase().startsWith("v=")) {
+    errors.push('La etiqueta "v=DMARC1" debe ser la primera del registro');
+  }
+
+  rawTags.forEach((t) => {
+    const eq = t.indexOf("=");
+    if (eq === -1) {
+      errors.push(`"${t}" no tiene el formato esperado tag=valor`);
+      return;
+    }
+    const key = t.slice(0, eq).trim().toLowerCase();
+    const value = t.slice(eq + 1).trim();
+    tags[key] = value;
+    if (!DMARC_KNOWN_TAGS.has(key)) {
+      warnings.push(`Etiqueta desconocida: "${key}"`);
+    }
+  });
+
+  if (tags.v && tags.v.toUpperCase() !== "DMARC1") {
+    errors.push(`La versión debe ser exactamente "DMARC1" (se encontró "${tags.v}")`);
+  }
+
+  if (!tags.p) {
+    errors.push('Falta la etiqueta "p=" (política) — es obligatoria');
+  } else if (!DMARC_POLICY_VALUES.has(tags.p.toLowerCase())) {
+    errors.push(`"p=${tags.p}" no es válido — debe ser none, quarantine o reject`);
+  } else if (tags.p.toLowerCase() === "none") {
+    warnings.push('La política es "none": solo monitorea, no bloquea ni pone en cuarentena correo falsificado.');
+  }
+
+  if (tags.sp && !DMARC_POLICY_VALUES.has(tags.sp.toLowerCase())) {
+    errors.push(`"sp=${tags.sp}" no es válido — debe ser none, quarantine o reject`);
+  }
+
+  if (!tags.rua) {
+    warnings.push(
+      'No hay etiqueta "rua=" — no se están recibiendo reportes agregados, así que no hay visibilidad de quién envía correo en nombre del dominio.'
+    );
+  } else if (!isValidMailtoList(tags.rua)) {
+    errors.push(`"rua=${tags.rua}" no tiene el formato esperado (una o más direcciones mailto:, separadas por coma)`);
+  }
+
+  if (tags.ruf && !isValidMailtoList(tags.ruf)) {
+    errors.push(`"ruf=${tags.ruf}" no tiene el formato esperado`);
+  }
+
+  if (tags.pct !== undefined) {
+    const pct = Number(tags.pct);
+    if (!Number.isInteger(pct) || pct < 0 || pct > 100) {
+      errors.push(`"pct=${tags.pct}" debe ser un número entero entre 0 y 100`);
+    }
+  }
+
+  if (tags.adkim && !DMARC_ALIGNMENT_VALUES.has(tags.adkim.toLowerCase())) {
+    errors.push(`"adkim=${tags.adkim}" debe ser "r" (relaxed) o "s" (strict)`);
+  }
+  if (tags.aspf && !DMARC_ALIGNMENT_VALUES.has(tags.aspf.toLowerCase())) {
+    errors.push(`"aspf=${tags.aspf}" debe ser "r" (relaxed) o "s" (strict)`);
+  }
+
+  return { errors, warnings };
 }
 
 // --- Listas negras (blacklists) ---
