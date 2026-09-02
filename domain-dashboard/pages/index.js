@@ -19,17 +19,118 @@ function expirationStatus(rdap) {
   return "good";
 }
 
+function spfStatus(spf) {
+  if (!spf.ok) return "critical";
+  if (spf.validation?.errors?.length > 0) return "critical";
+  if (spf.validation?.warnings?.length > 0) return "warning";
+  return "good";
+}
+
 function dmarcStatus(dmarc) {
   if (!dmarc.ok) return "critical";
-  if (dmarc.policy === "reject" || dmarc.policy === "quarantine") return "good";
+  if (dmarc.validation?.errors?.length > 0) return "critical";
   if (dmarc.policy === "none") return "warning";
+  if (dmarc.validation?.warnings?.length > 0) return "warning";
   return "good";
+}
+
+function ValidationList({ validation }) {
+  if (!validation) return null;
+  const { errors = [], warnings = [] } = validation;
+  if (errors.length === 0 && warnings.length === 0) return null;
+
+  return (
+    <div style={{ marginTop: 8 }}>
+      {errors.map((e, i) => (
+        <p key={`err-${i}`} className="muted" style={{ color: "var(--critical)", marginBottom: 3 }}>
+          ✕ {e}
+        </p>
+      ))}
+      {warnings.map((w, i) => (
+        <p key={`warn-${i}`} className="muted" style={{ color: "#8a5c00", marginBottom: 3 }}>
+          ! {w}
+        </p>
+      ))}
+    </div>
+  );
 }
 
 function blacklistStatus(blacklists) {
   if (blacklists.isListed) return "critical";
   if (blacklists.hasUncertain) return "neutral";
   return "good";
+}
+
+// --- Recomendaciones: qué hacer cuando una tarjeta sale en amarillo o rojo ---
+// Cada función devuelve un texto accionable, o null si no aplica (todo bien).
+function expirationRecommendation(rdap, status) {
+  if (status === "critical") {
+    return "Este dominio ya expiró. Se recomienda renovarlo cuanto antes con tu registrador, antes de que se libere y alguien más pueda registrarlo.";
+  }
+  if (status === "warning") {
+    return "El dominio está por expirar. Se recomienda renovarlo pronto para no perder el control sobre él.";
+  }
+  return null;
+}
+
+function registrationRecommendation(rdap) {
+  if (!rdap.ok) {
+    return "Verifica que el dominio esté escrito correctamente, o considera registrarlo si aún está disponible.";
+  }
+  return null;
+}
+
+function blacklistRecommendation(blacklists, status) {
+  if (status === "critical") {
+    const names = blacklists.listedIn.join(", ");
+    return `El dominio está listado en: ${names}. Se recomienda revisar la causa (por ejemplo un sitio comprometido o envío masivo no autorizado) y solicitar la exclusión ("delisting") directamente en el sitio de esa lista.`;
+  }
+  if (status === "neutral" && blacklists.hasUncertain) {
+    return "No se pudo verificar contra alguna de las listas en este momento. Intenta consultar de nuevo más tarde.";
+  }
+  return null;
+}
+
+function mxRecommendation(mx, status) {
+  if (status === "critical") {
+    return "El dominio no tiene registros MX activos, por lo que no puede recibir correo. Si necesitas usar correo con este dominio, agrega registros MX con tu proveedor de DNS.";
+  }
+  return null;
+}
+
+function spfRecommendation(spf, status) {
+  if (status === "critical") {
+    if (!spf.ok) {
+      return "No se encontró un registro SPF. Se recomienda crear uno para indicar qué servidores están autorizados a enviar correo en nombre del dominio.";
+    }
+    return "Se recomienda corregir los errores de sintaxis señalados arriba, editando el registro SPF con tu proveedor de DNS.";
+  }
+  if (status === "warning") {
+    return "Se recomienda revisar las advertencias señaladas arriba para evitar que el SPF falle de forma silenciosa.";
+  }
+  return null;
+}
+
+function dmarcRecommendation(dmarc, status) {
+  if (status === "critical") {
+    if (!dmarc.ok) {
+      return "No se encontró un registro DMARC. Se recomienda publicar uno para proteger el dominio contra suplantación de identidad (phishing en su nombre).";
+    }
+    return "Se recomienda corregir los errores de sintaxis señalados arriba, editando el registro DMARC con tu proveedor de DNS.";
+  }
+  if (status === "warning") {
+    return "Se recomienda avanzar gradualmente hacia una política más estricta (quarantine o reject) una vez que confirmes que tu correo legítimo se autentica bien, y agregar \"rua=\" si falta para empezar a recibir reportes.";
+  }
+  return null;
+}
+
+function Recommendation({ text }) {
+  if (!text) return null;
+  return (
+    <p className="recommendation">
+      💡 <strong>Qué hacer:</strong> {text}
+    </p>
+  );
 }
 
 function Badge({ status }) {
@@ -63,6 +164,17 @@ function formatDate(iso) {
   } catch {
     return iso;
   }
+}
+
+// El TTL (Time To Live) indica cuántos segundos guarda un resolutor DNS la
+// respuesta en caché antes de volver a consultarla — en la práctica, qué
+// tan rápido se propaga un cambio en ese registro.
+function formatTtl(seconds) {
+  if (seconds === null || seconds === undefined) return null;
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.round(seconds / 60)} min`;
+  if (seconds < 86400) return `${Math.round(seconds / 3600)} h`;
+  return `${Math.round(seconds / 86400)} días`;
 }
 
 export default function Home() {
@@ -189,6 +301,12 @@ export default function Home() {
                     : data.expiration.error}
                 </p>
               )}
+              <Recommendation
+                text={expirationRecommendation(
+                  data.expiration,
+                  expirationStatus(data.expiration)
+                )}
+              />
             </Card>
 
             <Card
@@ -240,6 +358,7 @@ export default function Home() {
               ) : (
                 <p className="muted">{data.expiration.error}</p>
               )}
+              <Recommendation text={registrationRecommendation(data.expiration)} />
             </Card>
 
             <Card
@@ -258,54 +377,67 @@ export default function Home() {
                   </li>
                 ))}
               </ul>
+              <Recommendation
+                text={blacklistRecommendation(
+                  data.blacklists,
+                  blacklistStatus(data.blacklists)
+                )}
+              />
             </Card>
 
-            <Card
-              title="Servidores MX"
-              status={data.mx.ok ? (data.mx.hasMoreThanTwo ? "neutral" : "good") : "critical"}
-            >
+            <Card title="Servidores MX" status={data.mx.ok ? "good" : "critical"}>
               {data.mx.ok ? (
                 <>
                   <ul className="list">
-                    {data.mx.top2.map((r) => (
-                      <li key={r.host}>
+                    {data.mx.records.map((r) => (
+                      <li key={`${r.host}-${r.priority}`}>
                         {r.host} <span className="muted">(prioridad {r.priority})</span>
+                        {formatTtl(r.ttl) && (
+                          <span className="muted"> — TTL: {formatTtl(r.ttl)}</span>
+                        )}
                       </li>
                     ))}
                   </ul>
-                  <p className="muted">
-                    {data.mx.hasMoreThanTwo
-                      ? `Tiene más de 2 registros MX (total: ${data.mx.total})`
-                      : `Total de registros MX: ${data.mx.total}`}
-                  </p>
+                  <p className="muted">Total de registros MX: {data.mx.total}</p>
                 </>
               ) : (
                 <p className="muted">{data.mx.error}</p>
               )}
+              <Recommendation
+                text={mxRecommendation(data.mx, data.mx.ok ? "good" : "critical")}
+              />
             </Card>
 
-            <Card title="Registro SPF" status={data.spf.ok ? "good" : "critical"}>
+            <Card title="Registro SPF" status={spfStatus(data.spf)}>
               {data.spf.ok ? (
-                <code className="record">{data.spf.record}</code>
+                <>
+                  <code className="record">{data.spf.record}</code>
+                  {formatTtl(data.spf.ttl) && (
+                    <p className="muted">TTL: {formatTtl(data.spf.ttl)}</p>
+                  )}
+                  <ValidationList validation={data.spf.validation} />
+                </>
               ) : (
                 <p className="muted">{data.spf.error}</p>
               )}
+              <Recommendation text={spfRecommendation(data.spf, spfStatus(data.spf))} />
             </Card>
 
             <Card title="Registro DMARC" status={dmarcStatus(data.dmarc)}>
               {data.dmarc.ok ? (
                 <>
                   <code className="record">{data.dmarc.record}</code>
-                  {data.dmarc.policy === "none" && (
-                    <p className="muted">
-                      Política "none": existe DMARC pero no está bloqueando nada
-                      todavía.
-                    </p>
+                  {formatTtl(data.dmarc.ttl) && (
+                    <p className="muted">TTL: {formatTtl(data.dmarc.ttl)}</p>
                   )}
+                  <ValidationList validation={data.dmarc.validation} />
                 </>
               ) : (
                 <p className="muted">{data.dmarc.error}</p>
               )}
+              <Recommendation
+                text={dmarcRecommendation(data.dmarc, dmarcStatus(data.dmarc))}
+              />
             </Card>
           </div>
         </main>
